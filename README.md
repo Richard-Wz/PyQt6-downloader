@@ -153,6 +153,13 @@ python -m PyInstaller --onefile --windowed --name "<APPNAME>" --icon=icon.ico --
 
 The generated executable will be available in the `dist` folder.
 
+
+### 5. Troubleshoot
+If the downloader encounters error 403, most probably is because of yt-dlp outdated
+```bash
+python -m pip install -U yt-dlp
+```
+
 ---
 
 ## License
