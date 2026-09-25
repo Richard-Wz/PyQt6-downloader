@@ -21,15 +21,19 @@ def strip_ansi_codes(s: str) -> str:
 # Allow multithreading for downloads to prevent UI blocking
 class DownloadThread(QThread):
     progress_DL = pyqtSignal(str)           # Signal to update progress messages
+    playlist_progress = pyqtSignal(int, int) # Signal: completed items, total items
     finished_DL = pyqtSignal(bool, str)     # Signal to indicate download completion or error
     
     # Init method
-    def __init__(self, url, download_dir, format_type, bitrate):
+    def __init__(self, url, download_dir, format_type, bitrate, download_type):
         super().__init__()
         self.url = url
         self.download_dir = download_dir
         self.format_type = format_type
         self.bitrate = bitrate
+        self.download_type = download_type
+        self.playlist_total = 0
+        self.completed_playlist_items = set()
 
     # Run method to start the download process
     def run(self): 
@@ -41,10 +45,18 @@ class DownloadThread(QThread):
         
         os.makedirs(output_dir, exist_ok=True)
 
+        # Do not pre-scan a YouTube Mix here. A separate extraction can
+        # report only the currently resolved item even though the real
+        # playlist download discovers more items. We therefore obtain the
+        # count from the actual download info_dict and update it dynamically.
+        if self.download_type == "Playlist / Mix":
+            self.progress_DL.emit("Preparing playlist / Mix...")
+
         # Configure download options based on format and bitrate
         if self.format_type == "MP3":
             ydl_opts = {
                 "format": "bestaudio/best",
+                "noplaylist": self.download_type == "Single Video",
                 "postprocessors": [
                     {
                         "key": "FFmpegExtractAudio",
@@ -71,9 +83,9 @@ class DownloadThread(QThread):
                 "postprocessor_args": {
                     "thumbnailsconvertor": [
                         "-vf",
-                        "scale=500:500:force_original_aspect_ratio=decrease,pad=500:500:(ow-iw)/2:(oh-ih)/2,setsar=1"
+                        "scale=500:500:force_original_aspect_ratio=increase,crop=500:500,setsar=1"
                     ]
-                },
+                }   
             }
         else:  # MP4
             # For MP4, use format selection with video quality
@@ -85,6 +97,7 @@ class DownloadThread(QThread):
             
             ydl_opts = {
                 "format": format_str,
+                "noplaylist": self.download_type == "Single Video",
                 "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
                 "progress_hooks": [self.progress_hook],
                 "merge_output_format": "mp4",
@@ -106,8 +119,11 @@ class DownloadThread(QThread):
                 ],
                 "writethumbnail": True,
                 "postprocessor_args": {
-                    "thumbnailsconvertor": ["-vf", "scale=500:-2,setsar=1"]
-                },
+                    "thumbnailsconvertor": [
+                        "-vf",
+                        "scale=500:500:force_original_aspect_ratio=increase,crop=500:500,setsar=1"
+                    ]
+                }  
             }
 
         # Download process with error handling
@@ -122,11 +138,57 @@ class DownloadThread(QThread):
     
     # Progress hook to emit download progress updates
     def progress_hook(self, d):
-        if d['status'] == 'downloading':
-            percent = d.get('_percent_str', 'N/A')
-            speed = d.get('_speed_str', 'N/A')
+        info = d.get("info_dict") or {}
+
+        if d.get("status") == "downloading":
+            percent = d.get("_percent_str", "N/A")
+            speed = d.get("_speed_str", "N/A")
             self.progress_DL.emit(f"Downloading... {percent} at {speed}")
-        elif d['status'] == 'finished':
+
+        elif d.get("status") == "finished":
+            if self.download_type == "Playlist / Mix":
+                video_id = info.get("id")
+                playlist_index = info.get("playlist_index")
+
+                # playlist_count is the best total when yt-dlp knows it.
+                # n_entries is a fallback. The value may become known later
+                # while a YouTube Mix is being expanded.
+                detected_total = info.get("playlist_count") or info.get("n_entries")
+                if detected_total:
+                    try:
+                        detected_total = int(detected_total)
+                        if detected_total > self.playlist_total:
+                            self.playlist_total = detected_total
+                    except (TypeError, ValueError):
+                        pass
+
+                # Count each video once. Using the video ID prevents audio,
+                # thumbnail and post-processing callbacks from incrementing
+                # the playlist counter multiple times.
+                item_key = video_id or playlist_index
+                if item_key is not None and item_key not in self.completed_playlist_items:
+                    self.completed_playlist_items.add(item_key)
+                    completed = len(self.completed_playlist_items)
+                    total = self.playlist_total
+
+                    # If yt-dlp reported a tiny/partial total for a Mix and
+                    # we have now passed it, it was not a reliable fixed
+                    # playlist size. Treat the total as unknown rather than
+                    # letting the GUI reach 100% prematurely.
+                    if total and completed > total:
+                        self.playlist_total = 0
+                        total = 0
+
+                    self.playlist_progress.emit(completed, total)
+                    if total:
+                        self.progress_DL.emit(
+                            f"Downloaded: {completed:,} / {total:,} items"
+                        )
+                    else:
+                        self.progress_DL.emit(
+                            f"Downloaded: {completed:,} item(s)"
+                        )
+
             if self.format_type == "MP3":
                 self.progress_DL.emit("Processing audio file...")
             else:
@@ -229,6 +291,52 @@ class Downloader(QMainWindow):
         format_layout.addWidget(format_label)
         format_layout.addWidget(self.format_combo, 1)
         layout.addLayout(format_layout)
+        
+        # Download type selection layout
+        download_type_layout = QHBoxLayout()
+
+        download_type_label = QLabel("Download:")
+        download_type_label.setStyleSheet(
+            "font-size: 14px; color: #F8C61E; font-weight: bold;"
+        )
+        download_type_label.setFixedWidth(70)
+
+        self.download_type_combo = QComboBox()
+        self.download_type_combo.addItems([
+            "Single Video",
+            "Playlist / Mix"
+        ])
+        self.download_type_combo.setStyleSheet("""
+            QComboBox {
+                padding: 10px;
+                font-size: 14px;
+                color: #F8C61E;
+                border: 2px solid #555;
+                background-color: #2a3139;
+                min-height: 20px;
+            }
+            QComboBox:focus {
+                border: 2px solid #F8C61E;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2a3139;
+                color: #F8C61E;
+                selection-background-color: #F8C61E;
+                selection-color: #252C37;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #3a4149;
+                color: #F8C61E;
+                border-left: 2px solid #F8C61E;
+            }
+        """)
+
+        download_type_layout.addWidget(download_type_label)
+        download_type_layout.addWidget(self.download_type_combo, 1)
+        layout.addLayout(download_type_layout)
         
         # Bitrate selection layout
         bitrate_layout = QHBoxLayout()
@@ -358,6 +466,15 @@ class Downloader(QMainWindow):
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
 
+        # Playlist progress/count label
+        self.progress_count_label = QLabel("")
+        self.progress_count_label.setStyleSheet(
+            "font-size: 13px; color: #F8C61E; font-weight: bold;"
+        )
+        self.progress_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_count_label.setVisible(False)
+        layout.addWidget(self.progress_count_label)
+
         # Status/Log area
         status_label = QLabel("Status:")
         status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #F8C61E;")
@@ -410,19 +527,31 @@ class Downloader(QMainWindow):
         
         format_type = self.format_combo.currentText()
         bitrate = self.bitrate_combo.currentText()
+        download_type = self.download_type_combo.currentText()
         
         self.download_btn.setEnabled(False)
         self.browse_btn.setEnabled(False)
         self.format_combo.setEnabled(False)
         self.bitrate_combo.setEnabled(False)
+        self.download_type_combo.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+        self.progress_bar.setRange(0, 0)  # Indeterminate until playlist count is known
+        self.progress_count_label.setVisible(download_type == "Playlist / Mix")
+        self.progress_count_label.setText(
+            "Checking playlist..." if download_type == "Playlist / Mix" else ""
+        )
 
         quality_str = f"{bitrate}kbps" if format_type == "MP3" else ("Best Quality" if bitrate == "Best" else f"{bitrate}p")
-        self.append_status(f"\n{'='*60}\nStarting download for URL: {url}\nFormat: {format_type} | Quality: {quality_str}")
+        self.append_status(
+            f"\n{'='*60}\n"
+            f"Starting download for URL: {url}\n"
+            f"Download: {download_type} | "
+            f"Format: {format_type} | Quality: {quality_str}"
+        )
 
-        self.download_thread = DownloadThread(url, self.download_dir, format_type, bitrate)
+        self.download_thread = DownloadThread(url, self.download_dir, format_type, bitrate, download_type)
         self.download_thread.progress_DL.connect(self.update_progress)
+        self.download_thread.playlist_progress.connect(self.update_playlist_progress)
         self.download_thread.finished_DL.connect(self.download_finished)
         self.download_thread.start()
 
@@ -430,14 +559,33 @@ class Downloader(QMainWindow):
     def update_progress(self, message):
         self.append_status(message)
     
+    # Update playlist item progress
+    def update_playlist_progress(self, completed, total):
+        # A YouTube Mix may not expose a fixed total. In that case keep the
+        # progress bar indeterminate instead of incorrectly showing 100%.
+        if total > completed and total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(completed)
+            self.progress_count_label.setText(
+                f"Playlist progress: {completed:,} / {total:,} items"
+            )
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.progress_count_label.setText(
+                f"Downloaded: {completed:,} item(s)"
+            )
+
     # Handle download completion or error
     def download_finished(self, success, message):
         self.append_status(message)
         self.progress_bar.setVisible(False)
+        self.progress_count_label.setVisible(False)
+        self.progress_count_label.setText("")
         self.download_btn.setEnabled(True)
         self.browse_btn.setEnabled(True)
         self.format_combo.setEnabled(True)
         self.bitrate_combo.setEnabled(True)
+        self.download_type_combo.setEnabled(True)
 
         if success:
             QMessageBox.information(self, "Download Complete", message)
